@@ -1,6 +1,6 @@
-# VATT Data Reduction
+# VATT Scripts
 
-Repo for various data reduction scripts for the VATT4k instrument at the
+Repo for various data processing scripts for the VATT4k instrument at the
 Vatican Advanced Technology Telescope (VATT).
 
 ## reduce
