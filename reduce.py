@@ -231,14 +231,19 @@ for d in unique_dirs:
             print(f"No good flats for {d} upper={filter_key[0]} lower={filter_key[1]}, skipping master flat")
             continue
 
-        # Normalise and sigma-clip each chip independently
-        def make_master_chip(frames):
-            stack = np.stack([f / np.median(f) for f in frames], axis=0)
-            clipped = sigma_clip(stack, sigma=3, axis=0)
-            return np.ma.median(clipped, axis=0).data
+        # Make master flat from
+        def make_master_chip(amp1_frames, amp2_frames):
+            # Normalize each frame by the median of both chips combined
+            stack_amp1 = np.stack([a1 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                                   for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+            stack_amp2 = np.stack([a2 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                                   for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+            clipped_amp1 = sigma_clip(stack_amp1, sigma=3, axis=0)
+            clipped_amp2 = sigma_clip(stack_amp2, sigma=3, axis=0)
+            return np.ma.mean(clipped_amp1, axis=0).data, np.ma.mean(clipped_amp2, axis=0).data
 
-        master_amp1 = make_master_chip([p[0] for p in good_pairs])
-        master_amp2 = make_master_chip([p[1] for p in good_pairs])
+        master_amp1, master_amp2 = make_master_chip([p[0] for p in good_pairs],
+                                                    [p[1] for p in good_pairs])
         master_flats[d][filter_key] = (master_amp1, master_amp2)
 
         print(f"Master flat for {d} upper={filter_key[0]} lower={filter_key[1]} from {len(good_pairs)} frames")
@@ -299,7 +304,7 @@ for d in unique_dirs:
         reduced_amp1 = science['amp1'] / mf_amp1
         reduced_amp2 = science['amp2'] / mf_amp2
 
-        # Stitch here at the very end, same geometry as original
+        # Stitch here at the very end
         reduced = np.flipud(np.concatenate((reduced_amp2, reduced_amp1), axis=0))
 
         out_dir = im_dir / "reduced" / d
