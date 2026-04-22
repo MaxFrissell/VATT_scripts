@@ -87,9 +87,8 @@ for im_file in im_files:
         flat_paths.append(rel_path)
         flat_headers.append(header)
 
-paths_split = [path.parts for path in im_files]
-only_dirs = [row[1] for row in paths_split]
-unique_dirs = list(set(only_dirs))
+# build from relative paths so won't break when inputting a nested path
+unique_dirs = list({path.parts[0] for path in bias_paths + flat_paths + science_paths})
 
 bias_paths_split = [path.parts for path in bias_paths]
 bias_only_dir = [row[0] for row in bias_paths_split]
