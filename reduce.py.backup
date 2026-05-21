@@ -67,7 +67,7 @@ for im_file in im_files:
     with fits.open(im_file) as hdu_list:
         header = hdu_list[0].header
 
-        # Read and orient each  keep them separatechip 
+        # Read and orient each chip — keep them separate
         amp1 = np.flipud(hdu_list[1].data)   # bottom chip, flip vertically
         amp2 = hdu_list[2].data               # top chip, no transform needed
 
@@ -167,7 +167,7 @@ for i, d in enumerate(unique_dirs):
     if d in no_biases:
         master_biases[i] = find_nearest_bias(d, available_bias_dirs, master_biases, unique_dirs)
 
-# Write master  stitch chips here just for the output filebiases 
+# Write master biases — stitch chips here just for the output file
 for d, mb in zip(unique_dirs, master_biases):
     out_path = im_dir / "reduced" / d
     out_path.mkdir(parents=True, exist_ok=True)
@@ -202,49 +202,61 @@ for i, d in enumerate(unique_dirs):
         science['amp2'] = science['amp2'] - mb_amp2
 
 print("Subtracted master biases from flats and science frames")
-print("\nOrganizing flats by filter")
+print("\nMaking master flats")
 
-# Group raw flats by filter, keeping track of which night they came from
-flats_by_filter = {}
+flats_by_dir_filter = {d: {} for d in unique_dirs}
+
 for d in unique_dirs:
     for flat in flats_by_dir[d]:
         upper, lower = parse_filter(flat['header']['FILTER'])
         filter_key = (upper, lower)
-        if filter_key not in flats_by_filter:
-            flats_by_filter[filter_key] = {}
-        if d not in flats_by_filter[filter_key]:
-            flats_by_filter[filter_key][d] = []
-        flats_by_filter[filter_key][d].append((flat['amp1'], flat['amp2']))
+        if filter_key not in flats_by_dir_filter[d]:
+            flats_by_dir_filter[d][filter_key] = []
+        flats_by_dir_filter[d][filter_key].append((flat['amp1'], flat['amp2']))
+
+master_flats = {d: {} for d in unique_dirs}
+
+for d in unique_dirs:
+    for filter_key, chip_pairs in flats_by_dir_filter[d].items():
+
+        # Outlier rejection based on whole-frame median (average of both chips)
+        good_pairs = []
+        for amp1, amp2 in chip_pairs:
+            med = (np.median(amp1) + np.median(amp2)) / 2
+            if med < 20000 or med > 50000:
+                print(f"Flat for {d} upper={filter_key[0]} lower={filter_key[1]} has median {med:.1f} counts, skipping")
+            else:
+                good_pairs.append((amp1, amp2))
+
+        if len(good_pairs) == 0:
+            print(f"No good flats for {d} upper={filter_key[0]} lower={filter_key[1]}, skipping master flat")
+            continue
+
+        # Make master flat from
+        def make_master_chip(amp1_frames, amp2_frames):
+            # Normalize each frame by the median of both chips combined
+            stack_amp1 = np.stack([a1 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                                   for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+            stack_amp2 = np.stack([a2 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                                   for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+            clipped_amp1 = sigma_clip(stack_amp1, sigma=3, axis=0)
+            clipped_amp2 = sigma_clip(stack_amp2, sigma=3, axis=0)
+            return np.ma.mean(clipped_amp1, axis=0).data, np.ma.mean(clipped_amp2, axis=0).data
+
+        master_amp1, master_amp2 = make_master_chip([p[0] for p in good_pairs],
+                                                    [p[1] for p in good_pairs])
+        master_flats[d][filter_key] = (master_amp1, master_amp2)
+
+        print(f"Master flat for {d} upper={filter_key[0]} lower={filter_key[1]} from {len(good_pairs)} frames")
+
+all_master_flats = {}
+for d in unique_dirs:
+    for filter_key, chip_pair in master_flats[d].items():
+        if filter_key not in all_master_flats:
+            all_master_flats[filter_key] = []
+        all_master_flats[filter_key].append((d, chip_pair))
 
 Path(f"{im_dir}/reduced/master_flats").mkdir(parents=True, exist_ok=True)
-
-def make_master_chip(amp1_frames, amp2_frames):
-    """Normalize each frame by the median of both chips combined, then sigma-clip and average."""
-    # Normalize each frame by the median of both chips combined
-    stack_amp1 = np.stack([a1 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
-                           for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
-    stack_amp2 = np.stack([a2 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
-                           for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
-    clipped_amp1 = sigma_clip(stack_amp1, sigma=3, axis=0)
-    clipped_amp2 = sigma_clip(stack_amp2, sigma=3, axis=0)
-    return np.ma.mean(clipped_amp1, axis=0).data, np.ma.mean(clipped_amp2, axis=0).data
-
-def make_master_flat_from_raw_flats(chip_pairs):
-    """Create master flat from raw flats with outlier rejection."""
-    # Outlier rejection based on whole-frame median
-    good_pairs = []
-    for amp1, amp2 in chip_pairs:
-        med = (np.median(amp1) + np.median(amp2)) / 2
-        if med < 20000 or med > 50000:
-            continue
-        good_pairs.append((amp1, amp2))
-    
-    if len(good_pairs) == 0:
-        return None, 0
-    
-    master_amp1, master_amp2 = make_master_chip([p[0] for p in good_pairs],
-                                                [p[1] for p in good_pairs])
-    return (master_amp1, master_amp2), len(good_pairs)
 
 def generate_date_combinations(dates):
     """Generate all combinations of dates from 1 date up to all dates."""
@@ -254,27 +266,48 @@ def generate_date_combinations(dates):
             all_combos.append(list(combo))
     return all_combos
 
+def make_combined_master_flat(chip_pairs_list):
+    """Combine flats from multiple dates into a single master flat."""
+    all_pairs = []
+    for chip_pairs in chip_pairs_list:
+        all_pairs.extend(chip_pairs)
+    
+    # Outlier rejection based on whole-frame median
+    good_pairs = []
+    for amp1, amp2 in all_pairs:
+        med = (np.median(amp1) + np.median(amp2)) / 2
+        if med >= 20000 and med <= 50000:
+            good_pairs.append((amp1, amp2))
+    
+    if len(good_pairs) == 0:
+        return None
+    
+    # Make master flat from the combined good pairs
+    def make_master_chip(amp1_frames, amp2_frames):
+        stack_amp1 = np.stack([a1 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                               for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+        stack_amp2 = np.stack([a2 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
+                               for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
+        clipped_amp1 = sigma_clip(stack_amp1, sigma=3, axis=0)
+        clipped_amp2 = sigma_clip(stack_amp2, sigma=3, axis=0)
+        return np.ma.mean(clipped_amp1, axis=0).data, np.ma.mean(clipped_amp2, axis=0).data
+    
+    master_amp1, master_amp2 = make_master_chip([p[0] for p in good_pairs],
+                                                [p[1] for p in good_pairs])
+    return (master_amp1, master_amp2), len(good_pairs)
+
 chosen_master_flats = {}
 
-for filter_key, nights_dict in flats_by_filter.items():
+for filter_key, entries in all_master_flats.items():
     upper, lower = filter_key
-    nights = sorted(nights_dict.keys())
-    
-    if len(nights) == 1:
-        # Only one night with this filter, make master flat directly
-        night = nights[0]
-        chip_pairs = nights_dict[night]
-        master_flat, num_frames = make_master_flat_from_raw_flats(chip_pairs)
-        if master_flat:
-            chosen_master_flats[filter_key] = master_flat
-            print(f"Master flat for upper={upper} lower={lower} from {num_frames} frames on {night}")
-        else:
-            print(f"No good flats for upper={upper} lower={lower}")
+
+    if len(entries) == 1:
+        chosen = entries[0][1]
     else:
-        # Multiple nights available, ask user which to combine
-        combinations_list = generate_date_combinations(nights)
+        dates = [d for d, _ in entries]
+        combinations_list = generate_date_combinations(dates)
         
-        print(f"\nMultiple nights with flats for upper={upper} lower={lower}:")
+        print(f"\nMultiple master flats for upper={upper} lower={lower}:")
         for j, combo in enumerate(combinations_list):
             combo_str = " + ".join(combo)
             print(f"  {j}: {combo_str}")
@@ -285,16 +318,18 @@ for filter_key, nights_dict in flats_by_filter.items():
             if choice.isdigit() and 0 <= int(choice) < len(combinations_list):
                 selected_combo = combinations_list[int(choice)]
                 
-                # Gather all raw flats from selected nights
-                all_chip_pairs = []
-                for night in selected_combo:
-                    all_chip_pairs.extend(nights_dict[night])
+                # Get the chip pairs for selected dates
+                selected_pairs = []
+                for date in selected_combo:
+                    for d, chip_pair in entries:
+                        if d == date:
+                            selected_pairs.append([chip_pair])
+                            break
                 
-                master_flat, num_frames = make_master_flat_from_raw_flats(all_chip_pairs)
-                if master_flat:
-                    chosen_master_flats[filter_key] = master_flat
-                    combo_str = " + ".join(selected_combo)
-                    print(f"Combined {num_frames} frames from {len(selected_combo)} night(s): {combo_str}")
+                result = make_combined_master_flat(selected_pairs)
+                if result:
+                    chosen, num_frames = result
+                    print(f"Combined {num_frames} frames from {len(selected_combo)} date(s)")
                     break
                 else:
                     print("No good frames in that combination, try another")
@@ -302,12 +337,13 @@ for filter_key, nights_dict in flats_by_filter.items():
                 print("Invalid choice, try again")
         start_time = time.time()
 
-    if filter_key in chosen_master_flats:
-        # Stitch chips for the output file
-        mf_amp1, mf_amp2 = chosen_master_flats[filter_key]
-        stitched = np.flipud(np.concatenate((mf_amp2, mf_amp1), axis=0))
-        out_name = f"{upper}_{lower}_master_flat.fits"
-        fits.writeto(im_dir / "reduced" / "master_flats" / out_name, stitched, overwrite=True)
+    chosen_master_flats[filter_key] = chosen  # (master_amp1, master_amp2)
+
+    # Stitch chips for the output file
+    mf_amp1, mf_amp2 = chosen
+    stitched = np.flipud(np.concatenate((mf_amp2, mf_amp1), axis=0))
+    out_name = f"{upper}_{lower}_master_flat.fits"
+    fits.writeto(im_dir / "reduced" / "master_flats" / out_name, stitched, overwrite=True)
 
 print(f"\nWrote master flats to {im_dir}/reduced/master_flats")
 print("Flat field correcting science images")
