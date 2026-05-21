@@ -13,3 +13,10 @@ night are combined into a master flat, then you choose which night's filter
 to use for all data in that filter.
 
 -t/--time will print the time the script took at the end.
+
+## change_imagetyp
+
+python3 change_imagetyp.py dir #,##-##,##-##,etc. type
+
+Changes the IMAGETYP fits header value to the new type in all listed image
+numbers specified by either a list or list of ranges.
