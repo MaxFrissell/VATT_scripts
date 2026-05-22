@@ -3,7 +3,7 @@
 Script to change IMAGETYP header values in FITS images.
 
 Usage:
-    change_imagetyp.py <directory> <numbers> <new_value>
+    python3 change_imagetyp.py <directory> <numbers> <new_value>
 
 Arguments:
     directory: Path to directory containing FITS files
