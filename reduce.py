@@ -1,12 +1,6 @@
-## This program is called like:
+## Memory-efficient version of reduce.py
+## Two-pass approach: build masters first, then reduce science images one at a time
 ## python3 reduce.py path_to_day_subdirs (-t or --time)
-## -t/--time flag times the reduction (ignoring waiting for user response)
-## makes /path_to_subdirs/reduced directory for reduced images
-## things to know:
-##     turns all flats of a filter on a single night into a master flat for that filter
-##     if there are flats for a given filter on multiple nights, it will ask which combination
-##         to use (individual dates, or any combination of multiple dates) and create a combined
-##         master flat from the selected dates
 
 import numpy as np 
 from astropy.io import fits
@@ -17,6 +11,7 @@ from datetime import datetime
 import re
 import time
 from itertools import combinations
+from collections import defaultdict
 
 start_time = time.time()
 elapsed_before_input = 0
@@ -26,6 +21,23 @@ def parse_filter(filter_str):
     lower = re.search(r'lower:\s*(\S+)', filter_str).group(1)
     return upper, lower
 
+def read_and_prep_image(im_file):
+    """Read FITS file, extract chips, remove overscan. Returns (amp1, amp2, header)."""
+    with fits.open(im_file) as hdu_list:
+        header = hdu_list[0].header
+        amp1 = np.flipud(hdu_list[1].data)   # bottom chip, flip vertically
+        amp2 = hdu_list[2].data               # top chip, no transform needed
+        
+        # Remove overscan from each chip individually
+        amp1 = amp1[:, :-24]
+        amp2 = amp2[:, :-24]
+    
+    return amp1, amp2, header
+
+def stitch_for_output(amp1, amp2):
+    """Stitch chips for writing: amp2 on top, amp1 on bottom, then flipud."""
+    return np.flipud(np.concatenate((amp2, amp1), axis=0))
+
 print()
 
 time_flag = '-t' in sys.argv or '--time' in sys.argv
@@ -34,6 +46,7 @@ args = [a for a in sys.argv[1:] if a not in ('-t', '--time')]
 im_dir = Path(args[0])
 im_files = list(im_dir.rglob("*.fits"))
 
+# Filter out reduced, master, and test images
 temp = []
 for file in im_files:
     name = file.parts[2]
@@ -47,180 +60,143 @@ for file in im_files:
 Path(f"{im_dir}/reduced").mkdir(exist_ok=True)
 im_files = temp
 
-sub_dirs = list({f.parent.relative_to(im_dir) for f in im_files if f.parent != im_dir})
+# Categorize files by type without loading them yet
+bias_files = []
+flat_files = []
+science_files = []
 
-print(f"\nBeginning read-in of {len(im_files)} images. . .")
-
-# Load all fits files, keeping chips separate
-# Each entry stores amp1 and amp2 independently throughout processing
-all_files = []
-bias_paths = []
-bias_chips = []   # list of (amp1, amp2) tuples
-flat_paths = []
-flat_chips = []   # list of (amp1, amp2) tuples
-flat_headers = []
-science_chips = []  # list of (amp1, amp2) tuples
-science_paths = []
-science_headers = []
+print(f"\nScanning {len(im_files)} images for type...")
 
 for im_file in im_files:
-    with fits.open(im_file) as hdu_list:
+    with fits.open(im_file, memmap=True) as hdu_list:
         header = hdu_list[0].header
+        imagetyp = header.get('IMAGETYP', 'unknown')
+        
+        if imagetyp == 'zero':
+            bias_files.append(im_file)
+        elif imagetyp == 'flat':
+            flat_files.append(im_file)
+        elif imagetyp == 'object':
+            science_files.append(im_file)
 
-        # Read and orient each  keep them separatechip 
-        amp1 = np.flipud(hdu_list[1].data)   # bottom chip, flip vertically
-        amp2 = hdu_list[2].data               # top chip, no transform needed
+print(f"Found {len(bias_files)} biases, {len(flat_files)} flats, {len(science_files)} science images\n")
 
-        # Remove overscan from each chip individually
-        amp1 = amp1[:, :-24]
-        amp2 = amp2[:, :-24]
+# ============================================================================
+# PASS 1: Build master biases
+# ============================================================================
+print("=" * 60)
+print("PASS 1: BUILDING MASTER BIASES")
+print("=" * 60)
 
-    rel_path = im_file.relative_to(im_dir)
+# Organize bias files by date directory
+biases_by_dir = defaultdict(list)
+for bias_file in bias_files:
+    date_dir = bias_file.parts[-2]  # second-to-last part is date dir
+    biases_by_dir[date_dir].append(bias_file)
 
-    if header['IMAGETYP'] == 'zero':
-        bias_chips.append((amp1, amp2))
-        bias_paths.append(rel_path)
-    elif header['IMAGETYP'] == 'object':
-        science_chips.append((amp1, amp2))
-        science_paths.append(rel_path)
-        science_headers.append(header)
-    elif header['IMAGETYP'] == 'flat':
-        flat_chips.append((amp1, amp2))
-        flat_paths.append(rel_path)
-        flat_headers.append(header)
+unique_dirs = sorted(biases_by_dir.keys())
+master_biases = {}  # {date_dir: (master_amp1, master_amp2)} or date_dir: None
 
-# build from relative paths so won't break when inputting a nested path
-unique_dirs = list({path.parts[0] for path in bias_paths + flat_paths + science_paths})
-
-bias_paths_split = [path.parts for path in bias_paths]
-bias_only_dir = [row[0] for row in bias_paths_split]
-bias_div = [[] for _ in unique_dirs]
-
-for i, bias_dir in enumerate(bias_only_dir):
-    dir_index = unique_dirs.index(bias_dir)
-    bias_div[dir_index].append(bias_chips[i])  # appending (amp1, amp2) tuples
-
-print("\nBeginning processing biases\n")
-
-no_biases = []
-master_biases = []  # each entry is (master_amp1, master_amp2) or []
-
-for i, date_biases in enumerate(bias_div):
-    current_dir = unique_dirs[i]
-    have_biases = True
-
-    if len(date_biases) == 0:
-        no_biases.append(current_dir)
-        master_biases.append([])
-        print(f"No biases for {current_dir}")
-    else:
-        # Compute stats using combined chip data for outlier rejection,
-        # but keep chips separate for the actual master
-        means = [np.mean(a1 + a2) / 2 for a1, a2 in date_biases]
-        stds  = [np.std(np.concatenate([a1.ravel(), a2.ravel()])) for a1, a2 in date_biases]
-        med_mean = np.median(means)
-        med_std  = np.median(stds)
-
-        keep_list = []
-        for j in range(len(means)):
-            keep = True
-            if (means[j] > med_mean * 2) or (means[j] < med_mean / 2):
-                keep = False
-                print(f"One bias from {current_dir} is bad")
-            if (stds[j] > med_std * 2) or (stds[j] < med_std / 2):
-                keep = False
-                print(f"One bias from {current_dir} is bad")
-            keep_list.append(keep)
-
-        keepers = [chips for chips, keep in zip(date_biases, keep_list) if keep]
-
-        if len(keepers) < 9:
-            have_biases = False
-
-        if not have_biases:
-            print(f"For {current_dir} there are only {len(date_biases)} biases.")
-            no_biases.append(current_dir)
-            master_biases.append([])
-        else:
-            if len(keepers) % 2 == 0:
-                print(f"Odd number of biases remaining for {current_dir}, dropping one, to {len(keepers) - 1} total")
-                keepers = keepers[1:]
-
-            # Build master bias for each chip independently
-            master_amp1 = np.median(np.stack([c[0] for c in keepers], axis=0), axis=0)
-            master_amp2 = np.median(np.stack([c[1] for c in keepers], axis=0), axis=0)
-            master_biases.append((master_amp1, master_amp2))
-
-available_bias_dirs = [d for d, mb in zip(unique_dirs, master_biases) if not isinstance(mb, list)]
-
-def find_nearest_bias(target_dir, available_bias_dirs, master_biases, unique_dirs):
-    target_date = datetime.strptime(target_dir, "%Y%m%d")
-    available_dates = [datetime.strptime(d, "%Y%m%d") for d in available_bias_dirs]
-    deltas = [(abs((d - target_date).days), d, i) for i, d in enumerate(available_dates)]
-    deltas.sort(key=lambda x: (x[0], -x[1].timestamp()))
-    nearest_dir = deltas[0][1].strftime("%Y%m%d")
-    nearest_index = unique_dirs.index(nearest_dir)
-    print(f"Not enough biases for {target_dir}, using master bias from {nearest_dir}")
-    return master_biases[nearest_index]
-
-for i, d in enumerate(unique_dirs):
-    if d in no_biases:
-        master_biases[i] = find_nearest_bias(d, available_bias_dirs, master_biases, unique_dirs)
-
-# Write master  stitch chips here just for the output filebiases 
-for d, mb in zip(unique_dirs, master_biases):
-    out_path = im_dir / "reduced" / d
+for date_dir in unique_dirs:
+    bias_files_for_date = biases_by_dir[date_dir]
+    
+    if len(bias_files_for_date) == 0:
+        master_biases[date_dir] = None
+        continue
+    
+    # Load biases one at a time, compute stats
+    means = []
+    stds = []
+    bias_chips_temp = []
+    
+    for bias_file in bias_files_for_date:
+        amp1, amp2, _ = read_and_prep_image(bias_file)
+        bias_chips_temp.append((amp1, amp2))
+        means.append(np.mean((amp1 + amp2) / 2))
+        stds.append(np.std(np.concatenate([amp1.ravel(), amp2.ravel()])))
+    
+    med_mean = np.median(means)
+    med_std = np.median(stds)
+    
+    # Reject outliers
+    keep_list = []
+    for j, (amp1, amp2) in enumerate(bias_chips_temp):
+        keep = True
+        if (means[j] > med_mean * 2) or (means[j] < med_mean / 2):
+            keep = False
+        if (stds[j] > med_std * 2) or (stds[j] < med_std / 2):
+            keep = False
+        keep_list.append(keep)
+    
+    keepers = [(amp1, amp2) for (amp1, amp2), keep in zip(bias_chips_temp, keep_list) if keep]
+    
+    if len(keepers) < 9:
+        master_biases[date_dir] = None
+        # Clean up memory
+        del bias_chips_temp
+        continue
+    
+    if len(keepers) % 2 == 0:
+        keepers = keepers[1:]
+    
+    # Build master bias
+    master_amp1 = np.median(np.stack([c[0] for c in keepers], axis=0), axis=0)
+    master_amp2 = np.median(np.stack([c[1] for c in keepers], axis=0), axis=0)
+    master_biases[date_dir] = (master_amp1, master_amp2)
+    
+    # Write master bias
+    out_path = im_dir / "reduced" / date_dir
     out_path.mkdir(parents=True, exist_ok=True)
-    # Stitch for writing: amp2 on top, amp1 on bottom, then flipud (same as original)
-    stitched = np.flipud(np.concatenate((mb[1], mb[0]), axis=0))
+    stitched = stitch_for_output(master_amp1, master_amp2)
     fits.writeto(out_path / "master_bias.fits", stitched, overwrite=True)
+    
+    # Clean up memory
+    del bias_chips_temp, keepers
 
 print(f"\nWrote master biases to {im_dir}/reduced")
 
-# Sort flats and science by date dir, carrying chip tuples
-flats_by_dir   = {d: [] for d in unique_dirs}
-science_by_dir = {d: [] for d in unique_dirs}
+# Handle missing biases by finding nearest available
+def find_nearest_bias(target_dir, available_bias_dirs, master_biases_dict):
+    """Find nearest bias by date, load and return it."""
+    if target_dir in master_biases_dict and master_biases_dict[target_dir] is not None:
+        return master_biases_dict[target_dir]
+    
+    target_date = datetime.strptime(target_dir, "%Y%m%d")
+    available_dates = [(datetime.strptime(d, "%Y%m%d"), d) for d in master_biases_dict.keys() 
+                       if master_biases_dict[d] is not None]
+    
+    if not available_dates:
+        raise ValueError(f"No master biases available for {target_dir}")
+    
+    deltas = [(abs((d - target_date).days), d, dir_name) for d, dir_name in available_dates]
+    deltas.sort(key=lambda x: (x[0], -x[1].timestamp()))
+    nearest_date, nearest_dir = deltas[0][1], deltas[0][2]
+    print(f"No master bias for {target_dir}, using {nearest_dir}")
+    
+    # Load from disk
+    bias_path = im_dir / "reduced" / nearest_dir / "master_bias.fits"
+    with fits.open(bias_path) as hdul:
+        stitched = hdul[0].data
+        # Unstitched: flipud to get back original orientation, split
+        unstitched = np.flipud(stitched)
+        amp2, amp1 = np.array_split(unstitched, 2, axis=0)
+        return (amp1, amp2)
 
-for path, header, chips in zip(flat_paths, flat_headers, flat_chips):
-    d = path.parts[0]
-    flats_by_dir[d].append({'path': path, 'header': header, 'amp1': chips[0], 'amp2': chips[1]})
+# ============================================================================
+# PASS 2: Build master flats
+# ============================================================================
+print("\n" + "=" * 60)
+print("PASS 2: BUILDING MASTER FLATS")
+print("=" * 60)
 
-for path, header, chips in zip(science_paths, science_headers, science_chips):
-    d = path.parts[0]
-    science_by_dir[d].append({'path': path, 'header': header, 'amp1': chips[0], 'amp2': chips[1]})
-
-# Subtract master bias from each chip independently
-for i, d in enumerate(unique_dirs):
-    mb_amp1, mb_amp2 = master_biases[i]
-
-    for flat in flats_by_dir[d]:
-        flat['amp1'] = flat['amp1'] - mb_amp1
-        flat['amp2'] = flat['amp2'] - mb_amp2
-
-    for science in science_by_dir[d]:
-        science['amp1'] = science['amp1'] - mb_amp1
-        science['amp2'] = science['amp2'] - mb_amp2
-
-print("Subtracted master biases from flats and science frames")
-print("\nOrganizing flats by filter")
-
-# Group raw flats by filter, keeping track of which night they came from
-flats_by_filter = {}
-for d in unique_dirs:
-    for flat in flats_by_dir[d]:
-        upper, lower = parse_filter(flat['header']['FILTER'])
-        filter_key = (upper, lower)
-        if filter_key not in flats_by_filter:
-            flats_by_filter[filter_key] = {}
-        if d not in flats_by_filter[filter_key]:
-            flats_by_filter[filter_key][d] = []
-        flats_by_filter[filter_key][d].append((flat['amp1'], flat['amp2']))
-
-Path(f"{im_dir}/reduced/master_flats").mkdir(parents=True, exist_ok=True)
+# Organize flat files by date and filter
+flats_by_dir = defaultdict(list)
+for flat_file in flat_files:
+    date_dir = flat_file.parts[-2]
+    flats_by_dir[date_dir].append(flat_file)
 
 def make_master_chip(amp1_frames, amp2_frames):
     """Normalize each frame by the median of both chips combined, then sigma-clip and average."""
-    # Normalize each frame by the median of both chips combined
     stack_amp1 = np.stack([a1 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
                            for a1, a2 in zip(amp1_frames, amp2_frames)], axis=0)
     stack_amp2 = np.stack([a2 / np.median(np.concatenate([a1.ravel(), a2.ravel()]))
@@ -231,7 +207,6 @@ def make_master_chip(amp1_frames, amp2_frames):
 
 def make_master_flat_from_raw_flats(chip_pairs):
     """Create master flat from raw flats with outlier rejection."""
-    # Outlier rejection based on whole-frame median
     good_pairs = []
     for amp1, amp2 in chip_pairs:
         med = (np.median(amp1) + np.median(amp2)) / 2
@@ -254,19 +229,42 @@ def generate_date_combinations(dates):
             all_combos.append(list(combo))
     return all_combos
 
-chosen_master_flats = {}
+# Group flats by filter and collect all available nights
+flats_by_filter = {}
+for date_dir, flats_for_date in flats_by_dir.items():
+    for flat_file in flats_for_date:
+        amp1, amp2, header = read_and_prep_image(flat_file)
+        
+        # Subtract bias
+        master_bias = find_nearest_bias(date_dir, list(master_biases.keys()), master_biases)
+        if master_bias:
+            amp1 = amp1 - master_bias[0]
+            amp2 = amp2 - master_bias[1]
+        
+        upper, lower = parse_filter(header['FILTER'])
+        filter_key = (upper, lower)
+        
+        if filter_key not in flats_by_filter:
+            flats_by_filter[filter_key] = {}
+        if date_dir not in flats_by_filter[filter_key]:
+            flats_by_filter[filter_key][date_dir] = []
+        
+        flats_by_filter[filter_key][date_dir].append((amp1, amp2))
+
+Path(f"{im_dir}/reduced/master_flats").mkdir(parents=True, exist_ok=True)
+
+master_flats = {}  # {(upper, lower): (master_amp1, master_amp2)}
 
 for filter_key, nights_dict in flats_by_filter.items():
     upper, lower = filter_key
     nights = sorted(nights_dict.keys())
     
     if len(nights) == 1:
-        # Only one night with this filter, make master flat directly
         night = nights[0]
         chip_pairs = nights_dict[night]
         master_flat, num_frames = make_master_flat_from_raw_flats(chip_pairs)
         if master_flat:
-            chosen_master_flats[filter_key] = master_flat
+            master_flats[filter_key] = master_flat
             print(f"Master flat for upper={upper} lower={lower} from {num_frames} frames on {night}")
         else:
             print(f"No good flats for upper={upper} lower={lower}")
@@ -278,7 +276,7 @@ for filter_key, nights_dict in flats_by_filter.items():
         for j, combo in enumerate(combinations_list):
             combo_str = " + ".join(combo)
             print(f"  {j}: {combo_str}")
-
+        
         elapsed_before_input += time.time() - start_time
         while True:
             choice = input(f"Which combination to use? Enter number 0-{len(combinations_list)-1}: ")
@@ -292,7 +290,7 @@ for filter_key, nights_dict in flats_by_filter.items():
                 
                 master_flat, num_frames = make_master_flat_from_raw_flats(all_chip_pairs)
                 if master_flat:
-                    chosen_master_flats[filter_key] = master_flat
+                    master_flats[filter_key] = master_flat
                     combo_str = " + ".join(selected_combo)
                     print(f"Combined {num_frames} frames from {len(selected_combo)} night(s): {combo_str}")
                     break
@@ -301,41 +299,71 @@ for filter_key, nights_dict in flats_by_filter.items():
             else:
                 print("Invalid choice, try again")
         start_time = time.time()
-
-    if filter_key in chosen_master_flats:
-        # Stitch chips for the output file
-        mf_amp1, mf_amp2 = chosen_master_flats[filter_key]
-        stitched = np.flipud(np.concatenate((mf_amp2, mf_amp1), axis=0))
+    
+    if filter_key in master_flats:
+        mf_amp1, mf_amp2 = master_flats[filter_key]
+        stitched = stitch_for_output(mf_amp1, mf_amp2)
         out_name = f"{upper}_{lower}_master_flat.fits"
         fits.writeto(im_dir / "reduced" / "master_flats" / out_name, stitched, overwrite=True)
 
 print(f"\nWrote master flats to {im_dir}/reduced/master_flats")
-print("Flat field correcting science images")
 
-for d in unique_dirs:
-    for science in science_by_dir[d]:
-        upper, lower = parse_filter(science['header']['FILTER'])
+# ============================================================================
+# PASS 3: Reduce science images one at a time
+# ============================================================================
+print("\n" + "=" * 60)
+print("PASS 3: REDUCING SCIENCE IMAGES")
+print("=" * 60)
+print(f"Processing {len(science_files)} science images...\n")
+
+science_files_by_dir = defaultdict(list)
+for sci_file in science_files:
+    date_dir = sci_file.parts[-2]
+    science_files_by_dir[date_dir].append(sci_file)
+
+processed_count = 0
+for date_dir in sorted(science_files_by_dir.keys()):
+    sci_files_for_date = science_files_by_dir[date_dir]
+    
+    # Load master bias once per date
+    master_bias = find_nearest_bias(date_dir, list(master_biases.keys()), master_biases)
+    
+    for sci_file in sci_files_for_date:
+        # Load science image
+        amp1, amp2, header = read_and_prep_image(sci_file)
+        
+        # Subtract bias
+        if master_bias:
+            amp1 = amp1 - master_bias[0]
+            amp2 = amp2 - master_bias[1]
+        
+        # Apply flat field correction
+        upper, lower = parse_filter(header['FILTER'])
         filter_key = (upper, lower)
-
-        if filter_key not in chosen_master_flats:
-            print(f"No master flat for upper={upper} lower={lower}, skipping {science['path']}")
+        
+        if filter_key not in master_flats:
+            print(f"No master flat for {filter_key}, skipping {sci_file.name}")
             continue
-
-        mf_amp1, mf_amp2 = chosen_master_flats[filter_key]
-
-        # Flat-field each chip with its own master flat
-        reduced_amp1 = science['amp1'] / mf_amp1
-        reduced_amp2 = science['amp2'] / mf_amp2
-
-        # Stitch here at the very end
-        reduced = np.flipud(np.concatenate((reduced_amp2, reduced_amp1), axis=0))
-
-        out_dir = im_dir / "reduced" / d
+        
+        mf_amp1, mf_amp2 = master_flats[filter_key]
+        
+        # Flat-field each chip
+        reduced_amp1 = amp1 / mf_amp1
+        reduced_amp2 = amp2 / mf_amp2
+        
+        # Stitch and write
+        reduced = stitch_for_output(reduced_amp1, reduced_amp2)
+        
+        out_dir = im_dir / "reduced" / date_dir
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_name = "red_" + science['path'].name
-        fits.writeto(out_dir / out_name, reduced, reduced_amp2.header if hasattr(reduced_amp2, 'header') else science['header'], overwrite=True)
+        out_name = "red_" + sci_file.name
+        fits.writeto(out_dir / out_name, reduced, header, overwrite=True)
+        
+        processed_count += 1
+        if processed_count % 10 == 0:
+            print(f"  Processed {processed_count} science images...")
 
-print("\nWrote reduced science images")
+print(f"\nWrote {processed_count} reduced science images")
 
 if time_flag:
     total_time = elapsed_before_input + (time.time() - start_time)
