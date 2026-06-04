@@ -49,7 +49,7 @@ im_files = list(im_dir.rglob("*.fits"))
 # Filter out reduced, master, and test images
 temp = []
 for file in im_files:
-    name = file.parts[2]
+    name = file.name
     if 'reduced' in file.parts:
         pass
     elif (name[0] == 'm') or (name[0:4] == 'test'):
