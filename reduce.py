@@ -35,8 +35,8 @@ def parse_filter(filter_str):
 
 
 def needs_fringe(upper, lower):
-    """Return True for clear (case-insensitive) + VR/i/I (case-sensitive)."""
-    return upper.lower() == 'clear' and lower in FRINGE_LOWER_FILTERS
+    """Return True if either the upper or lower filter is in the fringe set (VR/i/I)."""
+    return upper in FRINGE_LOWER_FILTERS or lower in FRINGE_LOWER_FILTERS
 
 
 def read_and_prep_image(im_file):
