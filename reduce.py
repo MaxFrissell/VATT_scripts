@@ -5,7 +5,7 @@
 ## Build master fringe frames for filters using VR, i, or I
 ## De-fringe and write.
 ##
-## python3 reduce.py path_to_day_subdirs (-t or --time) (-m or --memory)
+## python3 reduce.py path_to_day_subdirs (-t or --time) (-m or --memory) (--median_grouped_means)
 
 import numpy as np
 from astropy.io import fits
@@ -25,7 +25,7 @@ elapsed_before_input = 0
 
 # Filters that need fringe correction (lower filter, case-sensitive)
 FRINGE_LOWER_FILTERS = {'VR', 'i', 'I'}
-FRINGE_BOX_SIZE = 500
+FRINGE_BOX_SIZE = 500 # size of the box for doing the sky-subtraction during fringe fielding
 
 
 def parse_filter(filter_str):
@@ -96,7 +96,8 @@ print()
 
 time_flag   = '-t' in sys.argv or '--time'   in sys.argv
 memory_flag = '-m' in sys.argv or '--memory' in sys.argv
-args = [a for a in sys.argv[1:] if a not in ('-t', '--time', '-m', '--memory')]
+mgm_flag    = '--median_grouped_means' in sys.argv
+args = [a for a in sys.argv[1:] if a not in ('-t', '--time', '-m', '--memory', '--median_grouped_means')]
 
 im_dir = Path(args[0])
 im_files = list(im_dir.rglob("*.fits"))
@@ -423,21 +424,132 @@ for fk in fringe_filter_keys:
           f"({info['count']} frames, {info['total']:.0f}s total)")
 
 # -----------------------------------------------------------------
-# Disk-based strip-wise sigma-clipped mean.
+# Disk-based strip-wise master fringe construction.
 #
-# Step 1: debias, flatten, sky-subtract each frame and write to a
-#         temp FITS file under reduced/temp/. One file per frame,
-#         never more than one frame in memory at once.
-# Step 2: read the temp files back in horizontal strips of
-#         STRIP_HEIGHT rows. For each strip, load that strip from
-#         every temp file, sigma-clip across the frame axis, take
-#         the mean, and write the strip into the master fringe.
-#         Peak memory = N_frames * STRIP_HEIGHT * image_width * 4 bytes.
-# Step 3: delete all temp files for this filter key.
+# For all modes:
+#   Step 1 — Grouping and ordering.
+#       Images selected for the master (matching filter + best exptime)
+#       are sorted to interleave nights as evenly as possible, so that
+#       consecutive image numbers from the same night are never placed
+#       in the same group. Concretely:
+#         a. Within each night, images are sorted by their trailing
+#            4-digit image number (the #### in the filename).
+#         b. Images are then drawn round-robin across nights in date
+#            order: image 0 from night A, image 0 from night B, …,
+#            image 1 from night A, image 1 from night B, …
+#       This guarantees that adjacent-numbered images from the same
+#       night are separated by at least (number_of_nights - 1) other
+#       images before the next one from that night appears.
+#
+#   Step 2 — Sky subtraction and temp file writing.
+#       Each ordered image is debias-corrected, flat-fielded, and
+#       sky-subtracted (500x500 box, for fringe construction only),
+#       then written to reduced/temp/ as float32. Never more than one
+#       image in memory at once.
+#
+# --median_grouped_means mode (>=33 frames):
+#   Step 3 — Grouped sigma-clipped means.
+#       The ordered temp files are split into the largest odd number
+#       of groups G such that each group has at least 11 images:
+#           G = largest odd number where floor(N / G) >= 11
+#       Images are assigned to groups by round-robin across the
+#       interleaved order (temp file 0 -> group 0, file 1 -> group 1,
+#       …), so each group is itself a well-mixed subset. For each
+#       group, a strip-wise sigma-clipped mean is computed across the
+#       frames in that group, producing G group-mean fringe frames
+#       held in memory simultaneously (small — each is one image).
+#   Step 4 — Pixel-wise median across group means.
+#       The G group-mean frames are stacked and a straight pixel-wise
+#       median is taken to produce the final master fringe.
+#
+# Default mode (sigma-clipped mean, or <33 frames fallback):
+#   Step 3 — Strip-wise sigma-clipped mean across all temp files.
+#
+# Step 5 — Cleanup.
+#       All temp files for this filter key are deleted. The temp
+#       directory is removed if empty.
 # -----------------------------------------------------------------
 
-STRIP_HEIGHT = 64
-SIGMA_THRESH = 3.0
+np.random.seed(1234)
+
+STRIP_HEIGHT  = 64
+SIGMA_THRESH  = 3.0
+MGM_MIN_TOTAL = 33    # minimum frames to attempt grouped mode
+MGM_MIN_GROUP = 11    # minimum frames per group
+
+
+def image_number(rec):
+    """Extract the trailing 4-digit image number from a filename."""
+    m = re.search(r'(\d{4})\.fits$', rec['path'].name)
+    return int(m.group(1)) if m else 0
+
+
+def interleave_by_night(records):
+    """
+    Sort records so that images from different nights are interleaved
+    as evenly as possible and adjacent image numbers from the same
+    night are never consecutive in the output list.
+
+    Algorithm:
+      1. Group records by date, sorting each night's images by image number.
+      2. Draw round-robin across nights in date order until exhausted.
+    """
+    by_night = defaultdict(list)
+    for r in records:
+        by_night[r['date']].append(r)
+    for night in by_night:
+        by_night[night].sort(key=image_number)
+
+    ordered = []
+    nights = sorted(by_night.keys())
+    queues = [by_night[n] for n in nights]
+    idx = [0] * len(queues)
+    while True:
+        added = False
+        for q_i, queue in enumerate(queues):
+            if idx[q_i] < len(queue):
+                ordered.append(queue[idx[q_i]])
+                idx[q_i] += 1
+                added = True
+        if not added:
+            break
+    return ordered
+
+
+def compute_n_groups(n_frames):
+    """
+    Return the largest odd number of groups G such that
+    floor(n_frames / G) >= MGM_MIN_GROUP, or None if not achievable
+    even with G=1.
+    """
+    best = None
+    # Start from the largest possible odd G and work down
+    max_g = n_frames // MGM_MIN_GROUP
+    if max_g < 1:
+        return None
+    # Find largest odd <= max_g
+    g = max_g if max_g % 2 == 1 else max_g - 1
+    if g >= 1:
+        best = g
+    return best
+
+
+def strip_clipped_mean(temp_paths, image_shape):
+    """Compute a strip-wise sigma-clipped mean over a list of temp FITS paths."""
+    n_rows, n_cols = image_shape
+    result = np.zeros(image_shape, dtype=np.float64)
+    for row_start in range(0, n_rows, STRIP_HEIGHT):
+        row_end = min(row_start + STRIP_HEIGHT, n_rows)
+        strips = np.stack(
+            [fits.getdata(p, memmap=False)[row_start:row_end].astype(np.float32)
+             for p in temp_paths],
+            axis=0
+        )
+        clipped = sigma_clip(strips, sigma=SIGMA_THRESH, axis=0)
+        result[row_start:row_end] = np.ma.mean(clipped, axis=0).data
+        del strips, clipped
+    return result
+
 
 Path(f"{im_dir}/reduced/master_fringes").mkdir(parents=True, exist_ok=True)
 temp_dir = Path(f"{im_dir}/reduced/temp")
@@ -455,15 +567,26 @@ for fk in fringe_filter_keys:
         if r['filter_key'] == fk and r['exptime'] == master_et
     ]
 
+    n_frames = len(master_files)
     print(f"\n  Building master fringe for {upper}+{lower} "
-          f"({len(master_files)} frames at {master_et:.0f}s)...")
+          f"({n_frames} frames at {master_et:.0f}s)...")
 
-    # ---- Step 1: write sky-subtracted temp files ----
+    # ---- Step 1: interleave images across nights ----
+    ordered = interleave_by_night(master_files)
+
+    # Decide mode
+    use_mgm = mgm_flag and n_frames >= MGM_MIN_TOTAL
+    if mgm_flag and not use_mgm:
+        print(f"  WARNING: only {n_frames} frames available "
+              f"(need >= {MGM_MIN_TOTAL} for --median_grouped_means). "
+              f"Falling back to sigma-clipped mean.")
+
+    # ---- Step 2: sky-subtract and write temp files ----
     temp_paths = []
     image_shape = None
+    print(f"  Writing {n_frames} sky-subtracted temp files...")
 
-    print(f"  Writing sky-subtracted temp files...")
-    for i, rec in enumerate(master_files):
+    for i, rec in enumerate(ordered):
         stitched, _ = debias_and_flatten(
             rec['path'],
             find_nearest_bias(rec['date'], list(master_biases.keys()), master_biases),
@@ -484,29 +607,38 @@ for fk in fringe_filter_keys:
         print(f"  No frames written for {upper}+{lower}, skipping")
         continue
 
-    n_rows, n_cols = image_shape
-    master_fringe = np.zeros(image_shape, dtype=np.float64)
+    # ---- Step 3+4: build master fringe ----
+    if use_mgm:
+        n_groups = compute_n_groups(n_frames)
+        print(f"  Splitting {n_frames} frames into {n_groups} groups "
+              f"(~{n_frames // n_groups} frames each) via round-robin assignment...")
 
-    # ---- Step 2: strip-wise sigma-clipped mean ----
-    print(f"  Computing strip-wise sigma-clipped mean "
-          f"({n_rows // STRIP_HEIGHT + 1} strips)...")
+        # Assign temp files to groups by round-robin so each group is
+        # itself a well-mixed, interleaved subset
+        group_paths = [[] for _ in range(n_groups)]
+        for i, p in enumerate(temp_paths):
+            group_paths[i % n_groups].append(p)
 
-    for row_start in range(0, n_rows, STRIP_HEIGHT):
-        row_end = min(row_start + STRIP_HEIGHT, n_rows)
+        # Compute sigma-clipped mean for each group
+        group_means = []
+        for g_i, g_paths in enumerate(group_paths):
+            print(f"    Group {g_i + 1}/{n_groups}: "
+                  f"sigma-clipped mean of {len(g_paths)} frames...")
+            group_mean = strip_clipped_mean(g_paths, image_shape)
+            group_means.append(group_mean)
 
-        # Load this strip from every temp file — shape (N_frames, strip_h, n_cols)
-        strips = np.stack(
-            [fits.getdata(p, memmap=False)[row_start:row_end].astype(np.float32)
-             for p in temp_paths],
-            axis=0
-        )
+        # Pixel-wise median across all group means
+        print(f"  Taking pixel-wise median across {n_groups} group means...")
+        master_fringe = np.median(np.stack(group_means, axis=0), axis=0)
+        del group_means
 
-        # Sigma-clip across frame axis (axis=0), same as original approach
-        clipped = sigma_clip(strips, sigma=SIGMA_THRESH, axis=0)
-        master_fringe[row_start:row_end] = np.ma.mean(clipped, axis=0).data
-        del strips, clipped
+    else:
+        # Default: single-pass strip-wise sigma-clipped mean
+        print(f"  Computing strip-wise sigma-clipped mean "
+              f"({image_shape[0] // STRIP_HEIGHT + 1} strips)...")
+        master_fringe = strip_clipped_mean(temp_paths, image_shape)
 
-    # ---- Step 3: clean up temp files for this filter key ----
+    # ---- Step 5: clean up temp files for this filter key ----
     for p in temp_paths:
         p.unlink()
 
