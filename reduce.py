@@ -5,7 +5,7 @@
 ## Build master fringe frames for filters using VR, i, or I
 ## De-fringe and write.
 ##
-## python3 reduce.py path_to_day_subdirs (-t or --time) (-m or --memory) (--median_grouped_means)
+## python3 reduce.py path_to_day_subdirs (-t or --time) (-m or --memory) (--median_grouped_means) (--no_defringing)
 
 import numpy as np
 from astropy.io import fits
