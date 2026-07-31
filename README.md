@@ -5,7 +5,7 @@ Vatican Advanced Technology Telescope (VATT).
 
 ## reduce
 
-python3 reduce.py dir (-t/--time)
+python3 reduce.py dir (-t/--time) (-m/--memory) (--no_defringing)
 
 Given a directory of subdirectories of dates (yyyymmdd) with images inside,
 does bias subtraction, flat fielding, and defringing. All flat in a filter from a single
@@ -19,6 +19,9 @@ scaling the fringe pattern linearly for other exposure times.
 -t/--time will print the time the script took at the end.
 
 -m/--memory will print the peak memory usage by the script.
+
+--no_defringing skips the defringing step, so all that is done is bias
+subtraction and flat fielding
 
 ## change_imagetyp
 
