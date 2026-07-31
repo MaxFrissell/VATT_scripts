@@ -12,6 +12,7 @@ from astropy.io import fits
 from astropy.stats import sigma_clip
 from photutils.background import Background2D, MedianBackground
 import sys
+import shutil
 import resource
 from pathlib import Path
 from datetime import datetime
@@ -94,21 +95,50 @@ def debias_and_flatten(im_file, master_bias, master_flat):
 
 print()
 
-time_flag   = '-t' in sys.argv or '--time'   in sys.argv
-memory_flag = '-m' in sys.argv or '--memory' in sys.argv
-mgm_flag    = '--median_grouped_means' in sys.argv
-args = [a for a in sys.argv[1:] if a not in ('-t', '--time', '-m', '--memory', '--median_grouped_means')]
+time_flag        = '-t' in sys.argv or '--time'   in sys.argv
+memory_flag      = '-m' in sys.argv or '--memory' in sys.argv
+mgm_flag         = '--median_grouped_means' in sys.argv
+no_defringe_flag = '--no_defringing' in sys.argv
+args = [a for a in sys.argv[1:] if a not in
+        ('-t', '--time', '-m', '--memory', '--median_grouped_means', '--no_defringing')]
 
 im_dir = Path(args[0])
-im_files = list(im_dir.rglob("*.fits"))
 
-# Filter out reduced, master, and test images
+
+def is_date_dirname(name, fmt="%Y%m%d"):
+    """Return True if `name` parses as a date in the given format (default YYYYMMDD)."""
+    try:
+        datetime.strptime(name, fmt)
+        return True
+    except ValueError:
+        return False
+
+
+# Only descend into top-level subdirectories of im_dir that are named as
+# dates (YYYYMMDD). This naturally skips 'reduced', any renamed variant of
+# it (e.g. 'reduced_with_standard_defringing'), and any other non-night
+# directory, regardless of what it's called.
+date_dirs = []
+ignored_dirs = []
+for entry in sorted(im_dir.iterdir()):
+    if entry.is_dir():
+        if is_date_dirname(entry.name):
+            date_dirs.append(entry)
+        else:
+            ignored_dirs.append(entry)
+
+for d in ignored_dirs:
+    print(f"Ignoring directory (name is not a recognized YYYYMMDD date): {d}")
+
+im_files = []
+for d in date_dirs:
+    im_files.extend(d.rglob("*.fits"))
+
+# Filter out master and test images within the night directories
 temp = []
 for file in im_files:
     name = file.name
-    if 'reduced' in file.parts:
-        pass
-    elif (name[0] == 'm') or (name[0:4] == 'test'):
+    if (name[0] == 'm') or (name[0:4] == 'test'):
         print(f"Throwing out {file}")
     else:
         temp.append(file)
@@ -363,65 +393,72 @@ print("\n" + "=" * 60)
 print("PASS 3: BUILDING MASTER FRINGE FRAMES")
 print("=" * 60)
 
-# Identify which filter keys need fringe correction and have a master flat
-fringe_filter_keys = [fk for fk in master_flats if needs_fringe(fk[0], fk[1])]
-
-# For each fringe filter key, find the best exposure time across all nights
-# (best = highest n_frames * exptime)
+# science_files_by_dir is needed below regardless of fringing (also used in PASS 4)
 science_files_by_dir = defaultdict(list)
 for sci_file in science_files:
     date_dir = sci_file.parts[-2]
     science_files_by_dir[date_dir].append(sci_file)
 
-# Scan headers to build exptime tallies per fringe filter key
-# (header-only scan, no pixel data loaded)
 fringe_exptime_counts = {}   # {filter_key: {exptime: {'count': n, 'total': t}}}
 fringe_sci_records  = []     # list of dicts for science files needing fringing
-
-print("Scanning science headers for fringe filter sets...")
-for date_dir in sorted(science_files_by_dir.keys()):
-    for sci_file in science_files_by_dir[date_dir]:
-        with fits.open(sci_file, memmap=True) as hdul:
-            header = hdul[0].header
-            try:
-                upper, lower = parse_filter(header['FILTER'])
-            except (KeyError, AttributeError):
-                continue
-            filter_key = (upper, lower)
-            if filter_key not in fringe_filter_keys:
-                continue
-            exptime = header.get('EXPTIME')
-            if exptime is None:
-                continue
-            exptime = float(exptime)
-
-            if filter_key not in fringe_exptime_counts:
-                fringe_exptime_counts[filter_key] = defaultdict(lambda: {'count': 0, 'total': 0.0})
-            fringe_exptime_counts[filter_key][exptime]['count'] += 1
-            fringe_exptime_counts[filter_key][exptime]['total'] += exptime
-
-            fringe_sci_records.append({
-                'path':       sci_file,
-                'date':       date_dir,
-                'upper':      upper,
-                'lower':      lower,
-                'filter_key': filter_key,
-                'exptime':    exptime,
-            })
-
-# Choose best exptime per filter key
 best_exptimes = {}   # {filter_key: float}
-for fk in fringe_filter_keys:
-    if fk not in fringe_exptime_counts:
-        print(f"  No science images found for {fk}, skipping fringe correction")
-        continue
-    counts = fringe_exptime_counts[fk]
-    chosen = max(counts, key=lambda et: counts[et]['total'])
-    info = counts[chosen]
-    best_exptimes[fk] = chosen
-    upper, lower = fk
-    print(f"  {upper}+{lower}: best exptime {chosen:.0f}s "
-          f"({info['count']} frames, {info['total']:.0f}s total)")
+
+if no_defringe_flag:
+    print("--no_defringing set: skipping fringe filter identification, header scan, "
+          "and master fringe construction")
+    fringe_filter_keys = []
+else:
+    # Identify which filter keys need fringe correction and have a master flat
+    fringe_filter_keys = [fk for fk in master_flats if needs_fringe(fk[0], fk[1])]
+
+    # For each fringe filter key, find the best exposure time across all nights
+    # (best = highest n_frames * exptime)
+
+    # Scan headers to build exptime tallies per fringe filter key
+    # (header-only scan, no pixel data loaded)
+    print("Scanning science headers for fringe filter sets...")
+    for date_dir in sorted(science_files_by_dir.keys()):
+        for sci_file in science_files_by_dir[date_dir]:
+            with fits.open(sci_file, memmap=True) as hdul:
+                header = hdul[0].header
+                try:
+                    upper, lower = parse_filter(header['FILTER'])
+                except (KeyError, AttributeError):
+                    continue
+                filter_key = (upper, lower)
+                if filter_key not in fringe_filter_keys:
+                    continue
+                exptime = header.get('EXPTIME')
+                if exptime is None:
+                    continue
+                exptime = float(exptime)
+
+                if filter_key not in fringe_exptime_counts:
+                    fringe_exptime_counts[filter_key] = defaultdict(lambda: {'count': 0, 'total': 0.0})
+                fringe_exptime_counts[filter_key][exptime]['count'] += 1
+                fringe_exptime_counts[filter_key][exptime]['total'] += exptime
+
+                fringe_sci_records.append({
+                    'path':       sci_file,
+                    'date':       date_dir,
+                    'upper':      upper,
+                    'lower':      lower,
+                    'filter_key': filter_key,
+                    'exptime':    exptime,
+                })
+
+    # Choose best exptime per filter key
+    for fk in fringe_filter_keys:
+        if fk not in fringe_exptime_counts:
+            print(f"  No science images found for {fk}, skipping fringe correction")
+            continue
+        counts = fringe_exptime_counts[fk]
+        chosen = max(counts, key=lambda et: counts[et]['total'])
+        info = counts[chosen]
+        best_exptimes[fk] = chosen
+        upper, lower = fk
+        print(f"  {upper}+{lower}: best exptime {chosen:.0f}s "
+              f"({info['count']} frames, {info['total']:.0f}s total)")
 
 # -----------------------------------------------------------------
 # Disk-based strip-wise master fringe construction.
@@ -551,10 +588,20 @@ def strip_clipped_mean(temp_paths, image_shape):
     return result
 
 
-Path(f"{im_dir}/reduced/master_fringes").mkdir(parents=True, exist_ok=True)
 temp_dir = Path(f"{im_dir}/reduced/temp")
-temp_dir.mkdir(parents=True, exist_ok=True)
+master_fringes_dir = Path(f"{im_dir}/reduced/master_fringes")
 master_fringes = {}   # {filter_key: ndarray}
+
+if no_defringe_flag:
+    # Remove any leftover fringe artifacts from a previous run (e.g. one
+    # done without --no_defringing), since none will be produced now.
+    for stale_dir in (temp_dir, master_fringes_dir):
+        if stale_dir.exists():
+            shutil.rmtree(stale_dir)
+            print(f"Removed leftover directory: {stale_dir}")
+else:
+    master_fringes_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
 for fk in fringe_filter_keys:
     if fk not in best_exptimes:
@@ -656,7 +703,10 @@ try:
 except OSError:
     pass
 
-print(f"\nWrote master fringe frames to {im_dir}/reduced/master_fringes")
+if no_defringe_flag:
+    print("\nFringe correction skipped (--no_defringing)")
+else:
+    print(f"\nWrote master fringe frames to {im_dir}/reduced/master_fringes")
 
 # ============================================================================
 # PASS 4: Reduce science images and apply fringe correction where needed
