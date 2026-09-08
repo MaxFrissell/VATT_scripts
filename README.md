@@ -5,7 +5,7 @@ Vatican Advanced Technology Telescope (VATT).
 
 ## reduce
 
-python3 reduce.py dir (-t/--time)
+python3 reduce.py dir (-t/--time) (-m/--memory) (--no_defringing)
 
 Given a directory of subdirectories of dates (yyyymmdd) with images inside,
 does bias subtraction, flat fielding, and defringing. All flat in a filter from a single
@@ -20,6 +20,7 @@ scaling the fringe pattern linearly for other exposure times.
 
 -m/--memory will print the peak memory usage by the script.
 
+<<<<<<< HEAD
 ## quick_reduce
 
 python3 quick_reduce.py date_dir1 (date_dir2 etc...) backup_master_flat_dir
@@ -39,6 +40,10 @@ script and the normal reduce.py script). These master flats will be used for
 reducing the images if there aren't enough good flats present in the date dirs
 for the corresponding filter. clear + filter and filter + clear are treated
 as the same filter.
+=======
+--no_defringing skips the defringing step, so all that is done is bias
+subtraction and flat fielding
+>>>>>>> 14a15c2d3eaefaf87e2c4aa862f5050f775df9f4
 
 ## change_imagetyp
 
