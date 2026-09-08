@@ -20,6 +20,26 @@ scaling the fringe pattern linearly for other exposure times.
 
 -m/--memory will print the peak memory usage by the script.
 
+## quick_reduce
+
+python3 quick_reduce.py date_dir1 (date_dir2 etc...) backup_master_flat_dir
+
+Given directories of dates with images inside it will do bias subtraction and
+flat fielding. If there are not enough flat images in the directories for a
+given filter, it will use the master flat from the backup_master_flat_dir
+directory.
+
+date_dir# - Need at least 1. A dir with .fits named as a date in yyyymmdd format.
+These images will be reduced using this script.
+
+backup_master_flat_dir - a directory containing .fits files that are master flats
+for all filter sets present in the date dirs. These files need to be named: 
+upperfilter_lowerfilter_master_flat.fits (same as master flats writted by this
+script and the normal reduce.py script). These master flats will be used for
+reducing the images if there aren't enough good flats present in the date dirs
+for the corresponding filter. clear + filter and filter + clear are treated
+as the same filter.
+
 ## change_imagetyp
 
 python3 change_imagetyp.py dir #,##-##,##-##,etc. type
