@@ -10,11 +10,12 @@ python3 reduce.py dir (-t/--time) (-m/--memory) (--no_defringing)
 Given a directory of subdirectories of dates (yyyymmdd) with images inside,
 does bias subtraction, flat fielding, and defringing. All flat in a filter from a single
 night are combined into a master flat, then you choose which night's filter
-to use for all data in that filter. Will produce master fringe frames for
-any filter set using VR, i, or I. For a given filter of this sort, it will
-determing the exposure time with the highest #images * exposure time to
-make a fringe frame and subtract from each image using that filter,
-scaling the fringe pattern linearly for other exposure times.
+to use for all data in that filter. Will produce master fringe frames using all
+i-band images >30 s exposure time, by sky subtraction, normalization, remove
+sources. Then, combine by sorting into 5 groups, doing pixel-wise sigma-clipped
+means in groups, and median between the groups. Fits a fringe amplitude by
+plotting lines over the images, fitting amplitude and taking the median fit.
+Does defringing all any image in VR, i, z, or I.
 
 -t/--time will print the time the script took at the end.
 
