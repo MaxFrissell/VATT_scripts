@@ -3,8 +3,35 @@
 ## Build master biases and flats
 ## Find master flats in the specified directory for flats we can't make from the data
 ## De-bias and flatten images
+## Fit a fringe scale to, and subtract a supplied master fringe from, every image
+##   with VR, i, I, or z in its filter set (same method as reduce.py). No master
+##   fringe is built here; the one given on the command line is used.
 ##
-## python3 quick_reduce.py date_dir1 (date_dir2 etc...) backup_master_flat_dir
+## python3 quick_reduce.py date_dir1 (date_dir2 etc...) backup_master_flat_dir master_fringe.fits
+##
+## The last argument is the master fringe FITS file (normalized, unitless, same
+## stitched shape as the reduced images, e.g. master_fringe_IClear_normalized.fits
+## produced by reduce.py). The second-to-last argument is the backup master flat dir.
+##
+## Fringe fitting and subtraction (every image with VR, i, I, or z in its set,
+## regardless of exposure time):
+##   N_LINES vertical and N_LINES horizontal lines (10 each) are sampled across
+##   the image. The science image is median-subtracted and pixels above the
+##   clipping sigma are masked. The sigma depends on the filter set
+##   (FILTER_SIGMA_SCHEDULES): VR tries 1.5 and then 2.0 if that fails; every
+##   other filter set uses 3.0. Lines with more than MAX_MASKED_FRAC (25%) of
+##   their pixels masked are replaced by lines placed between two of the
+##   remaining good lines. Along each line, a LINE_SMOOTH_WIDTH-pixel (5)
+##   mask-aware running mean is taken of both the science image and the master
+##   fringe, and a least-squares scale is fit per line. Lines with non-positive
+##   scales are dropped, then the half of the remaining lines with the largest
+##   mean per-pixel deviation are dropped, and the median of the remaining
+##   scales is the fringe scale. The scaled master fringe is subtracted from the
+##   image. If no valid scale can be found, the image is written without
+##   defringing and a warning is printed.
+##
+## Fringe scale log: fringe_scale_log.csv is written to the first date
+## directory's reduced_<timestamp>/ folder.
 
 import numpy as np
 from astropy.io import fits
@@ -13,6 +40,7 @@ from photutils.background import Background2D, MedianBackground
 import sys
 import shutil
 import resource
+import csv
 from pathlib import Path
 from datetime import datetime
 import re
@@ -20,10 +48,17 @@ import time
 from itertools import combinations
 from collections import defaultdict
 
+# Filters that need fringe correction (either wheel, case-sensitive)
+FRINGE_FILTERS = {'VR', 'i', 'I', 'z'}
+
 def parse_filter(filter_str):
     upper = re.search(r'upper:\s*(\S+)', filter_str).group(1)
     lower = re.search(r'lower:\s*(\S+)', filter_str).group(1)
     return upper, lower
+
+def needs_fringe(upper, lower):
+    """Return True if either filter in the set is one of FRINGE_FILTERS (VR/i/I/z)."""
+    return upper in FRINGE_FILTERS or lower in FRINGE_FILTERS
 
 def read_and_prep_image(im_file):
     """Read FITS file, extract chips, remove overscan. Returns (amp1, amp2, header)."""
@@ -65,10 +100,10 @@ def debias_and_flatten(im_file, master_bias, master_flat):
 print()
 
 args = [a for a in sys.argv[1:]]
-if(len(args) == 1):
-    raise ValueError("Needs at least two command line arguments, one dir of images, one of master flats")
+if(len(args) < 3):
+    raise ValueError("Needs at least three command line arguments: one dir of images, one dir of master flats, one master fringe FITS file")
 
-im_dirs = [Path(dir) for dir in args[:-1]]
+im_dirs = [Path(dir) for dir in args[:-2]]
 
 def is_date_dirname(name, fmt="%Y%m%d"):
     """Return True if `name` parses as a date in the given format (default YYYYMMDD)."""
@@ -81,10 +116,17 @@ def is_date_dirname(name, fmt="%Y%m%d"):
 ## -----------------------------------
 ## script is right through here
 
-# The last command line argument is a directory of backup master flats to
-# fall back on for any filter set we can't build a master flat for from
-# the date directories themselves.
-backup_flat_dir = Path(args[-1])
+# The last command line argument is the master fringe FITS file; the one
+# before it is a directory of backup master flats to fall back on for any
+# filter set we can't build a master flat for from the date directories
+# themselves.
+master_fringe_path = Path(args[-1])
+backup_flat_dir = Path(args[-2])
+
+if not master_fringe_path.is_file():
+    raise FileNotFoundError(f"Master fringe file not found: {master_fringe_path}")
+master_fringe = fits.getdata(master_fringe_path, memmap=False).astype(np.float64)
+print(f"Loaded master fringe {master_fringe_path} with shape {master_fringe.shape}")
 
 # Each remaining argument is now a date directory itself (images live
 # directly inside it, not nested under some parent). We no longer scan
@@ -433,7 +475,190 @@ for filter_key in sorted(missing_filter_keys):
         print(f"No master flat available (data or backup) for {filter_key}")
 
 # ============================================================================
-# PASS 3: Reduce science images (debias + flatten only, no fringe correction)
+# FRINGE HELPERS (line-profile scale fitting)
+# ============================================================================
+# --- BEGIN FRINGE HELPERS ---
+
+# Line-profile scale fitting
+N_LINES            = 10     # number of vertical AND number of horizontal lines
+LINE_SMOOTH_WIDTH  = 5      # running-mean width along each line (pixels)
+MIN_VALID_IN_WINDOW = 3     # min unmasked pixels in a smoothing window
+MAX_MASKED_FRAC    = 0.25   # lines with more than this fraction masked get replaced
+
+# Clipping sigma schedules by filter. Each list is tried in order; the first
+# sigma that yields a valid scale is used. Keys are matched against either
+# filter of the set (case-sensitive). Filters not listed use DEFAULT_SIGMA_SCHEDULE.
+FILTER_SIGMA_SCHEDULES = {
+    'VR': [1.5, 2.0],
+}
+DEFAULT_SIGMA_SCHEDULE = [3.0]
+
+
+def get_sigma_schedule(upper, lower):
+    """Return the list of clipping sigmas to try for this filter set."""
+    for filt, schedule in FILTER_SIGMA_SCHEDULES.items():
+        if filt in (upper, lower):
+            return schedule
+    return DEFAULT_SIGMA_SCHEDULE
+
+
+def sky_subtract_and_mask(image, sigma):
+    """
+    Median-subtract the image, then mask pixels more than `sigma` above the
+    sigma-clipped scatter (stars, cosmic rays, etc.). Returns a masked array
+    in the original (raw count) units.
+    """
+    centered = image - np.median(image)
+    clipped = sigma_clip(centered, sigma_upper=sigma, sigma_lower=np.inf,
+                         maxiters=5, masked=True)
+    return np.ma.masked_array(centered, mask=np.ma.getmaskarray(clipped))
+
+
+def get_line_positions(shape, n_lines=N_LINES):
+    """Evenly spaced row/column indices, kept away from the very edges."""
+    n_rows, n_cols = shape
+    cols = np.linspace(0.05 * n_cols, 0.95 * n_cols, n_lines).astype(int)
+    rows = np.linspace(0.05 * n_rows, 0.95 * n_rows, n_lines).astype(int)
+    return rows, cols
+
+
+def line_masked_fraction(masked, kind, idx):
+    """Fraction of pixels on a full row/column removed by the sigma mask."""
+    line = masked[:, idx] if kind == 'col' else masked[idx, :]
+    return float(np.mean(np.ma.getmaskarray(line)))
+
+
+def select_lines(masked, kind, init_positions, max_frac=MAX_MASKED_FRAC, max_levels=4):
+    """
+    Keep the initial lines whose masked fraction is <= max_frac. Each line
+    over the limit is replaced by a new line of the same orientation at the
+    midpoint between two adjacent good lines (nearest-first to the line being
+    replaced). If all midpoints at one level fail, the search subdivides
+    further, up to max_levels. If not enough good lines can be found, fewer
+    than the initial number are returned.
+    """
+    init_positions = [int(p) for p in init_positions]
+    good = sorted(p for p in init_positions
+                  if line_masked_fraction(masked, kind, p) <= max_frac)
+    bad = [p for p in init_positions if p not in good]
+    n_missing = len(bad)
+    if n_missing == 0 or len(good) < 2:
+        return good
+
+    tried = set(init_positions)
+    for _ in range(max_levels):
+        mids = []
+        for a, b in zip(good[:-1], good[1:]):
+            m = (a + b) // 2
+            if b - a > 1 and m not in tried:
+                mids.append(m)
+        mids.sort(key=lambda m: min(abs(m - p) for p in bad))
+
+        added = []
+        for m in mids:
+            if n_missing == 0:
+                break
+            tried.add(m)
+            if line_masked_fraction(masked, kind, m) <= max_frac:
+                added.append(m)
+                n_missing -= 1
+        good = sorted(set(good) | set(added))
+        if n_missing == 0:
+            break
+    return good
+
+
+def smooth_line(line, width=LINE_SMOOTH_WIDTH):
+    """
+    Mask-aware 1-D running mean along a line. Each output pixel is the mean
+    of the unmasked pixels in a `width`-pixel window centered on it. Pixels
+    with fewer than MIN_VALID_IN_WINDOW valid neighbors come out masked.
+    Works on masked arrays (science) and plain arrays (master fringe).
+    """
+    mask = np.ma.getmaskarray(line)
+    vals = np.where(mask, 0.0, np.ma.getdata(line)).astype(float)
+    valid = (~mask).astype(float)
+    kernel = np.ones(width)
+    sums = np.convolve(vals, kernel, mode='same')
+    counts = np.convolve(valid, kernel, mode='same')
+    with np.errstate(invalid='ignore', divide='ignore'):
+        means = sums / counts
+    out_mask = counts < MIN_VALID_IN_WINDOW
+    return np.ma.masked_array(np.where(out_mask, 0.0, means), mask=out_mask)
+
+
+def fit_line_scale(sci_line, master_line):
+    """
+    Closed-form least-squares scale s minimizing sum((sci - s*master)^2)
+    over unmasked pixels, plus the mean absolute per-pixel deviation between
+    the science line and the scaled master line at that scale.
+    Returns (scale, mean_abs_dev); both are np.nan if too few good pixels.
+    """
+    good = ~np.ma.getmaskarray(sci_line)
+    if good.sum() < 50:
+        return np.nan, np.nan
+    s = np.asarray(sci_line.data[good], dtype=float)
+    m = np.asarray(np.ma.getdata(master_line)[good], dtype=float)
+    denom = np.sum(m * m)
+    if not np.isfinite(denom) or denom <= 0:
+        return np.nan, np.nan
+    scale = np.sum(s * m) / denom
+    dev = np.mean(np.abs(s - scale * m))
+    return scale, dev
+
+
+def fit_fringe_scale_lines(image, master_fringe, sigma, n_lines=N_LINES):
+    """
+    Fit one scale per line (vertical + horizontal) using running means along
+    each line, then:
+      1. drop lines with a NaN or non-positive scale,
+      2. of the rest, keep the half (rounded up) with the smallest mean
+         absolute per-pixel deviation,
+      3. return the median scale of the kept lines.
+    Returns (median_scale, n_lines_used); (nan, 0) if no line has a valid scale.
+    """
+    masked = sky_subtract_and_mask(image, sigma)
+    rows0, cols0 = get_line_positions(image.shape, n_lines)
+    cols = select_lines(masked, 'col', cols0)
+    rows = select_lines(masked, 'row', rows0)
+
+    results = []
+    for c in cols:
+        results.append(fit_line_scale(smooth_line(masked[:, c]),
+                                      smooth_line(master_fringe[:, c])))
+    for r in rows:
+        results.append(fit_line_scale(smooth_line(masked[r, :]),
+                                      smooth_line(master_fringe[r, :])))
+
+    if not results:
+        return np.nan, 0
+    scales = np.array([res[0] for res in results], dtype=float)
+    devs = np.array([res[1] for res in results], dtype=float)
+
+    valid_idx = np.where(np.isfinite(scales) & (scales > 0))[0]
+    if valid_idx.size == 0:
+        return np.nan, 0
+
+    n_keep = int(np.ceil(valid_idx.size / 2))
+    keep_idx = valid_idx[np.argsort(devs[valid_idx])[:n_keep]]
+    return float(np.median(scales[keep_idx])), int(keep_idx.size)
+
+
+def fit_fringe_scale(image, master_fringe, sigma_schedule):
+    """
+    Try each clipping sigma in order and return the first valid result.
+    Returns (scale, sigma_used, n_lines_used); scale is nan if every sigma fails.
+    """
+    for sig in sigma_schedule:
+        scale, n_used = fit_fringe_scale_lines(image, master_fringe, sig)
+        if np.isfinite(scale):
+            return scale, sig, n_used
+    return np.nan, sigma_schedule[-1], 0
+# --- END FRINGE HELPERS ---
+
+# ============================================================================
+# PASS 3: Reduce science images (debias + flatten, then fit and subtract the
+# supplied master fringe for images in VR, i, I, or z filter sets)
 # ============================================================================
 print("\n" + "=" * 60)
 print("PASS 3: REDUCING SCIENCE IMAGES")
@@ -443,6 +668,11 @@ total_sci = sum(len(v) for v in science_files_by_dir.values())
 print(f"Processing {total_sci} science images...\n")
 
 processed_count = 0
+n_defringed = 0
+n_fringe_failed = 0
+warned_shape_mismatch = False
+fringe_log_rows = []   # (image_path, upper, lower, exptime, fringe_scale, fringe_scale_per_sec, sigma_used, n_lines_used)
+
 for date_name, sci_files_for_date in science_files_by_dir.items():
     master_bias = find_nearest_bias(date_name, master_biases)
 
@@ -468,6 +698,35 @@ for date_name, sci_files_for_date in science_files_by_dir.items():
         # Stitch
         reduced = stitch_for_output(amp1, amp2)
 
+        # Fringe correction: every image with VR, i, I, or z in its filter set
+        if needs_fringe(*filter_key):
+            if reduced.shape != master_fringe.shape:
+                if not warned_shape_mismatch:
+                    print(f"WARNING: image shape {reduced.shape} does not match master "
+                          f"fringe shape {master_fringe.shape}; affected images will be "
+                          f"written without defringing")
+                    warned_shape_mismatch = True
+                n_fringe_failed += 1
+            else:
+                sigma_schedule = get_sigma_schedule(*filter_key)
+                scale, sigma_used, n_lines_used = fit_fringe_scale(
+                    reduced, master_fringe, sigma_schedule)
+
+                exptime = header.get('EXPTIME')
+                exptime = float(exptime) if exptime is not None else np.nan
+                scale_per_sec = scale / exptime if np.isfinite(scale) else np.nan
+
+                if np.isfinite(scale):
+                    reduced -= scale * master_fringe
+                    n_defringed += 1
+                else:
+                    n_fringe_failed += 1
+                    print(f"WARNING: could not fit a fringe scale for {sci_file.name} "
+                          f"(sigma schedule {sigma_schedule}); writing without defringing")
+
+                fringe_log_rows.append((str(sci_file), upper, lower, exptime,
+                                        scale, scale_per_sec, sigma_used, n_lines_used))
+
         # Write
         out_dir = date_dir_lookup[date_name] / reduced_dirname
         out_name = "red_" + sci_file.name
@@ -478,5 +737,16 @@ for date_name, sci_files_for_date in science_files_by_dir.items():
             print(f"  Processed {processed_count} science images...")
 
 print(f"\nWrote {processed_count} reduced science images")
+print(f"Defringed {n_defringed} images; fringe fit failed for {n_fringe_failed}")
+
+# Log of fitted fringe scales (raw and exptime-normalized)
+log_path = im_dirs[0] / reduced_dirname / "fringe_scale_log.csv"
+with open(log_path, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(["image_path", "filter_upper", "filter_lower", "exptime",
+                     "fringe_scale", "fringe_scale_per_sec",
+                     "clip_sigma_used", "n_lines_used"])
+    writer.writerows(fringe_log_rows)
+print(f"Wrote fringe scale log to {log_path}")
 
 print("\n\nDone!\n")
