@@ -27,11 +27,13 @@ subtraction and flat fielding
 ## quick_reduce
 
 python3 quick_reduce.py date_dir1 (date_dir2 etc...) backup_master_flat_dir
+master_fringe.fits
 
 Given directories of dates with images inside it will do bias subtraction and
 flat fielding. If there are not enough flat images in the directories for a
 given filter, it will use the master flat from the backup_master_flat_dir
-directory.
+directory. Will do defringing using the same methods as *reduce.py*, using
+the master fringe frame from master_fringe.fits command line input.
 
 date_dir# - Need at least 1. A dir with .fits named as a date in yyyymmdd format.
 These images will be reduced using this script.
