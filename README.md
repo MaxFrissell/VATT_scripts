@@ -17,6 +17,9 @@ means in groups, and median between the groups. Fits a fringe amplitude by
 plotting lines over the images, fitting amplitude and taking the median fit.
 Does defringing all any image in VR, i, z, or I.
 
+dir - A directory containing date directories (yyyymmdd) which themselves
+contain .fits
+
 -t/--time will print the time the script took at the end.
 
 -m/--memory will print the peak memory usage by the script.
@@ -38,13 +41,16 @@ the master fringe frame from master_fringe.fits command line input.
 date_dir# - Need at least 1. A dir with .fits named as a date in yyyymmdd format.
 These images will be reduced using this script.
 
-backup_master_flat_dir - a directory containing .fits files that are master flats
+backup_master_flat_dir - A directory containing .fits files that are master flats
 for all filter sets present in the date dirs. These files need to be named: 
 upperfilter_lowerfilter_master_flat.fits (same as master flats writted by this
 script and the normal reduce.py script). These master flats will be used for
 reducing the images if there aren't enough good flats present in the date dirs
 for the corresponding filter. clear + filter and filter + clear are treated
 as the same filter.
+
+master_fringe.fits - A fits file master fringe frame with the same conventions
+as the files made from *reduce.py*.
 
 ## change_imagetyp
 
