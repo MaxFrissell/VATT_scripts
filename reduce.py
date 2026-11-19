@@ -887,7 +887,7 @@ else:
 
         # Write reference master fringe (normalized, unitless: counts/sec,
         # median-subtracted, divided by sigma-clipped whole-image std)
-        out_name = "master_fringe_IClear_normalized.fits"
+        out_name = "master_fringe_iClear_normalized.fits"
         fits.writeto(master_fringes_dir / out_name, iclear_master_fringe, overwrite=True)
         print(f"  Saved: {master_fringes_dir}/{out_name}")
 
